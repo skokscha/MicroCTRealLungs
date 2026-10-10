@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Из JP2 в STL — пайплайн RVE альвеолярной ткани</title>
+<style>
+:root{
+  --bg:#0b0f14; --panel:#111823; --panel2:#0e141d; --line:#1e2a3a;
+  --text:#d9e3ee; --dim:#8fa1b5; --accent:#4cc2ff; --accent2:#ffb454;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI",system-ui,Arial,sans-serif}
+header{padding:18px 26px 10px}
+header h1{margin:0;font-size:21px;font-weight:600}
+header p{margin:4px 0 0;color:var(--dim);font-size:13px;max-width:1100px}
+#app{display:flex;gap:14px;padding:0 26px;align-items:stretch}
+#stagewrap{position:relative}
+#stage{background:var(--panel2);border:1px solid var(--line);border-radius:10px;display:block}
+#replay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(5,8,12,.55);border-radius:10px}
+#replay button{font-size:16px;padding:10px 22px;background:#16202e;border:1px solid var(--accent);color:var(--text);border-radius:8px;cursor:pointer}
+#side{width:330px;display:flex;flex-direction:column;gap:10px}
+#steps{list-style:none;margin:0;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+#steps li{padding:6px 10px;border-radius:7px;color:var(--dim);cursor:pointer;font-size:13px;display:flex;gap:9px;align-items:baseline}
+#steps li .n{font-variant-numeric:tabular-nums;width:20px;display:inline-block;flex:0 0 auto}
+#steps li:hover{background:#16202e}
+#steps li.on{background:#16293c;color:#fff}
+#steps li.on .n{color:var(--accent)}
+#steps li.done .n{color:#3fae72}
+#desc{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;flex:1}
+#desc h3{margin:0 0 6px;font-size:15px;color:#fff}
+#desc p{margin:0 0 10px;color:var(--dim);font-size:13px}
+#chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:#16202e;border:1px solid var(--line);color:var(--accent);border-radius:20px;padding:2px 10px;font-size:12px;white-space:nowrap}
+#controls{display:flex;align-items:center;gap:10px;padding:12px 26px;max-width:1340px}
+#controls button{background:#16202e;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 14px;font-size:14px;cursor:pointer}
+#controls button:hover{border-color:var(--accent)}
+#pbar{flex:1;height:8px;background:#16202e;border-radius:4px;overflow:hidden;border:1px solid var(--line)}
+#pfill{height:100%;width:0;background:linear-gradient(90deg,#2b7fb8,var(--accent))}
+#ptime{color:var(--dim);font-variant-numeric:tabular-nums;width:96px;text-align:right;font-size:12px}
+footer{padding:6px 26px 20px;color:#5f7186;font-size:12px;max-width:1300px}
+</style>
+</head>
+<body>
+<header>
+ <h1>Из JP2 в STL — как рождается RVE альвеолярной ткани</h1>
+ <p>Пайплайн проекта MicroCTRealLungs: синхротронные срезы HiP-CT (ESRF) → сегментация → marching cubes → расчётный STL.
+    3D-часть — демонстрация на уменьшенной воксельной сетке (мешируется прямо в браузере); все числа в подписях — реальные, из проекта.</p>
+</header>
+<div id="app">
+ <div id="stagewrap">
+   <canvas id="stage" width="980" height="640"></canvas>
+   <div id="replay"><button id="replayBtn">↻ Смотреть снова</button></div>
+ </div>
+ <div id="side">
+  <ol id="steps"></ol>
+  <div id="desc"><h3 id="stTitle"></h3><p id="stText"></p><div id="chips"></div></div>
+ </div>
+</div>
+<div id="controls">
+ <button id="bPrev" title="Предыдущий шаг">⏮</button>
+ <button id="bPlay">⏸</button>
+ <button id="bNext" title="Следующий шаг">⏭</button>
+ <div id="pbar"><div id="pfill"></div></div>
+ <div id="ptime">0.0 / 0 c</div>
+</div>
+<footer>Данные: Human Organ Atlas (ESRF BM05, HiP-CT), датасет LADAF-2020-27, DOI 10.15151/ESRF-DC-572194514.
+Скрипты пайплайна: extract_cube.py → mesh_cube_v2.py → make_rve500.py.
+Демо-меш строится в браузере алгоритмом marching tetrahedra — том же принципе, что marching cubes в скриптах (skimage.measure.marching_cubes, level 0.5).</footer>
+
+<script>
+"use strict";
+/* ==================================================================== */
+const cv=document.getElementById("stage"), cx=cv.getContext("2d");
+const W=cv.width, H=cv.height;
+const fmtRu=n=>n.toLocaleString("ru-RU");
+
+/* ---------------- детерминированный 3D value-noise ---------------- */
+function ihash(n){
+  n=(n<<13)^n;
+  n=(Math.imul(n,Math.imul(n,Math.imul(n,15731)+789221))+1376312589)&0x7fffffff;
+  return n/0x7fffffff;
+}
+function hash3(x,y,z){ return ihash((x*73856093)^(y*19349663)^(z*83492791))/0x7fffffff; }
+function sstep(t){ return t*t*(3-2*t); }
+function vnoise(x,y,z){
+  const ix=Math.floor(x),iy=Math.floor(y),iz=Math.floor(z);
+  const u=sstep(x-ix),v=sstep(y-iy),w=sstep(z-iz);
+  const c000=hash3(ix,iy,iz),   c100=hash3(ix+1,iy,iz),
+        c010=hash3(ix,iy+1,iz), c110=hash3(ix+1,iy+1,iz),
+        c001=hash3(ix,iy,iz+1), c101=hash3(ix+1,iy,iz+1),
+        c011=hash3(ix,iy+1,iz+1),c111=hash3(ix+1,iy+1,iz+1);
+  const x00=c000+(c100-c000)*u, x10=c010+(c110-c010)*u,
+        x01=c001+(c101-c001)*u, x11=c011+(c111-c011)*u;
+  const y0=x00+(x10-x00)*v, y1=x01+(x11-x01)*v;
+  return y0+(y1-y0)*w;
+}
+function fbm(x,y,z){ return 0.65*vnoise(x,y,z)+0.35*vnoise(x*2.17+11.3,y*2.17+5.9,z*2.17+17.7); }
+
+/* ---------------- воксельное поле и маска (демо 18^3) ---------------- */
+const N=18, SP=4.9, P=N+2;
+const F=new Float32Array(N*N*N), M=new Uint8Array(N*N*N);
+{
+  const SC=0.155;
+  for(let k=0;k<N;k++)for(let j=0;j<N;j++)for(let i=0;i<N;i++)
+    F[i+N*(j+N*k)]=fbm(i*SC,j*SC,k*SC);
+  const smp=Array.from(F).sort((a,b)=>a-b);
+  const lo=smp[Math.floor(0.39*smp.length)], hi=smp[Math.floor(0.61*smp.length)];
+  for(let i=0;i<F.length;i++) M[i]=(F[i]>lo&&F[i]<hi)?1:0;
+}
+const pidx=(x,y,z)=>x+P*(y+P*z);
+const PM=new Uint8Array(P*P*P);
+for(let k=0;k<N;k++)for(let j=0;j<N;j++)for(let i=0;i<N;i++)
+  PM[pidx(i+1,j+1,k+1)]=M[i+N*(j+N*k)];
+
+/* ---------------- marching tetrahedra по бинарной маске ---------------- */
+const CORN=[[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
+const TETS=[[0,5,1,6],[0,1,2,6],[0,2,3,6],[0,3,7,6],[0,7,4,6],[0,4,5,6]];
+
+function buildMesh(){
+  const verts=[], tris=[], vmap=new Map();
+  const gval=(x,y,z)=>PM[pidx(x,y,z)];
+  function vid(a,b){
+    const ga=a[0]+P*(a[1]+P*a[2]), gb=b[0]+P*(b[1]+P*b[2]);
+    const key=ga<gb? ga*P*P*P+gb : gb*P*P*P+ga;
+    let v=vmap.get(key);
+    if(v===undefined){
+      v=verts.length/3;
+      const C0=(P-1)/2;
+      verts.push((a[0]+b[0])/2-C0,(a[1]+b[1])/2-C0,(a[2]+b[2])/2-C0);
+      vmap.set(key,v);
+    }
+    return v;
+  }
+  function addTri(i0,i1,i2,im){
+    const p0=[verts[3*i0],verts[3*i0+1],verts[3*i0+2]],
+          p1=[verts[3*i1],verts[3*i1+1],verts[3*i1+2]],
+          p2=[verts[3*i2],verts[3*i2+1],verts[3*i2+2]];
+    const e1=[p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]], e2=[p2[0]-p0[0],p2[1]-p0[1],p2[2]-p0[2]];
+    const n=[e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
+    const cen=[(p0[0]+p1[0]+p2[0])/3,(p0[1]+p1[1]+p2[1])/3,(p0[2]+p1[2]+p2[2])/3];
+    const d=[cen[0]-im[0],cen[1]-im[1],cen[2]-im[2]];
+    if(n[0]*d[0]+n[1]*d[1]+n[2]*d[2]<0) tris.push(i0,i2,i1); else tris.push(i0,i1,i2);
+  }
+  for(let z=0;z<P-1;z++)for(let y=0;y<P-1;y++)for(let x=0;x<P-1;x++){
+    const C=[gval(x,y,z),gval(x+1,y,z),gval(x+1,y+1,z),gval(x,y+1,z),
+             gval(x,y,z+1),gval(x+1,y,z+1),gval(x+1,y+1,z+1),gval(x,y+1,z+1)];
+    let any0=false,any1=false;
+    for(let m=0;m<8;m++){ if(C[m])any1=true; else any0=true; if(any0&&any1)break; }
+    if(!(any0&&any1)) continue;
+    for(let ti=0;ti<6;ti++){
+      const c=TETS[ti];
+      const bits=[!!C[c[0]],!!C[c[1]],!!C[c[2]],!!C[c[3]]];
+      const nIn=(bits[0]?1:0)+(bits[1]?1:0)+(bits[2]?1:0)+(bits[3]?1:0);
+      if(nIn===0||nIn===4) continue;
+      const pos=c.map(ci=>[x+CORN[ci][0],y+CORN[ci][1],z+CORN[ci][2]]);
+      const ins=[],outs=[];
+      for(let m=0;m<4;m++)(bits[m]?ins:outs).push(pos[m]);
+      const im=[0,0,0];
+      for(const p of ins){im[0]+=p[0]/ins.length;im[1]+=p[1]/ins.length;im[2]+=p[2]/ins.length;}
+      if(nIn===1||nIn===3){
+        const a=ins[0], ring=nIn===1?outs:ins;
+        const v0=vid(a,ring[0]), v1=vid(a,ring[1]), v2=vid(a,ring[2]);
+        addTri(v0,v1,v2,im);
+      }else{
+        const a=ins[0],b=ins[1],c1=outs[0],d1=outs[1];
+        const e00=vid(a,c1),e01=vid(a,d1),e11=vid(b,d1),e10=vid(b,c1);
+        addTri(e00,e01,e11,im); addTri(e00,e11,e10,im);
+      }
+    }
+  }
+  const V=new Float32Array(verts), T=new Int32Array(tris), nt=T.length/3;
+  const cenZ=new Float32Array(nt);
+  for(let t=0;t<nt;t++)
+    cenZ[t]=(V[3*T[3*t]+2]+V[3*T[3*t+1]+2]+V[3*T[3*t+2]+2])/3;
+  const orderZ=Array.from({length:nt},(_,i)=>i).sort((a,b)=>cenZ[a]-cenZ[b]);
+  let zmin=1e9,zmax=-1e9;
+  for(let i=2;i<V.length;i+=3){ if(V[i]<zmin)zmin=V[i]; if(V[i]>zmax)zmax=V[i]; }
+  return {verts:V,tris:T,nt,cenZ,orderZ,zmin,zmax,pristine:V.slice(0),nb:null,iters:0};
+}
+const mesh=buildMesh();
+/* соседи вершин для Taubin */
+{
+  const V=mesh.verts, T=mesh.tris;
+  const nb=Array.from({length:V.length/3},()=>new Set());
+  for(let t=0;t<T.length;t+=3){
+    const a=T[t],b=T[t+1],c=T[t+2];
+    nb[a].add(b);nb[a].add(c);nb[b].add(a);nb[b].add(c);nb[c].add(a);nb[c].add(b);
+  }
+  mesh.nb=nb.map(s=>Array.from(s));
+}
+function smoothPass(coef){
+  const V=mesh.verts, NB=mesh.nb, out=new Float32Array(V.length);
+  for(let v=0;v<V.length/3;v++){
+    const ns=NB[v]; let ax=0,ay=0,az=0;
+    for(let i=0;i<ns.length;i++){const u=ns[i];ax+=V[3*u];ay+=V[3*u+1];az+=V[3*u+2];}
+    const k=ns.length;
+    out[3*v]  =V[3*v]  +coef*(ax/k-V[3*v]);
+    out[3*v+1]=V[3*v+1]+coef*(ay/k-V[3*v+1]);
+    out[3*v+2]=V[3*v+2]+coef*(az/k-V[3*v+2]);
+  }
+  mesh.verts=out;
+}
+function taubinIter(){ smoothPass(0.5); smoothPass(-0.53); mesh.iters++; }
+
+/* ---------------- программный 3D-рендер ---------------- */
+function norm3(v){const l=Math.hypot(v[0],v[1],v[2]);return [v[0]/l,v[1]/l,v[2]/l];}
+const L1=norm3([0.42,-0.62,0.66]), L2=norm3([-0.5,0.25,0.4]);
+function rotVerts(V,yaw,pitch){
+  const n=V.length/3, out=new Float32Array(n*3);
+  const cY=Math.cos(yaw),sY=Math.sin(yaw),cP=Math.cos(pitch),sP=Math.sin(pitch);
+  for(let i=0;i<n;i++){
+    const x=V[3*i],y=V[3*i+1],z=V[3*i+2];
+    const x1=x*cY+z*sY, z1=-x*sY+z*cY;
+    out[3*i]=x1; out[3*i+1]=y*cP-z1*sP; out[3*i+2]=y*sP+z1*cP;
+  }
+  return out;
+}
+function drawMesh3D(ctx,mesh,opt){
+  const ox=opt.cx,oy=opt.cy,scale=opt.scale,yaw=opt.yaw,pitch=opt.pitch;
+  const reveal=opt.reveal===undefined?1:opt.reveal;
+  const base=opt.base||[186,196,184];
+  const R=rotVerts(mesh.verts,yaw,pitch);
+  const T=mesh.tris, nt=mesh.nt;
+  let list;
+  if(reveal<1) list=mesh.orderZ.slice(0,Math.floor(nt*Math.min(reveal,1)));
+  else list=mesh.orderZ;
+  const m=list.length;
+  if(m===0)return null;
+  const Z=new Float32Array(m), COL=new Int32Array(m);
+  for(let i=0;i<m;i++){
+    const t=list[i];
+    const a=3*T[3*t],b=3*T[3*t+1],c=3*T[3*t+2];
+    Z[i]=(R[a+2]+R[b+2]+R[c+2])/3;
+    const e1x=R[b]-R[a],e1y=R[b+1]-R[a+1],e1z=R[b+2]-R[a+2];
+    const e2x=R[c]-R[a],e2y=R[c+1]-R[a+1],e2z=R[c+2]-R[a+2];
+    const nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+    if(nz<=0){COL[i]=-1;continue;}          // задняя грань — отсекаем
+    const nl=Math.hypot(nx,ny,nz)||1;
+    let lum=0.30+0.55*Math.abs((nx/nl)*L1[0]+(ny/nl)*L1[1]+(nz/nl)*L1[2])
+                      +0.20*Math.abs((nx/nl)*L2[0]+(ny/nl)*L2[1]+(nz/nl)*L2[2]);
+    if(lum>1)lum=1;
+    COL[i]=(lum*15)|0;                       // 16 корзин яркости
+  }
+  const order=Array.from({length:m},(_,i)=>i).sort((x,y)=>Z[x]-Z[y]);
+  const NB=16, CH=220;                        // батчи по цвету внутри глубинных чанков
+  const r0=base[0]|0,g0=base[1]|0,b0=base[2]|0;
+  for(let start=0;start<m;start+=CH){
+    const end=Math.min(m,start+CH);
+    const paths=new Array(NB).fill(null);
+    for(let i=start;i<end;i++){
+      const k=order[i];
+      if(COL[k]<0)continue;
+      const t=list[k];
+      const a=3*T[3*t],b=3*T[3*t+1],c=3*T[3*t+2];
+      let p=paths[COL[k]];
+      if(!p){p=new Path2D();paths[COL[k]]=p;}
+      p.moveTo(ox+R[a]*scale,oy-R[a+1]*scale);
+      p.lineTo(ox+R[b]*scale,oy-R[b+1]*scale);
+      p.lineTo(ox+R[c]*scale,oy-R[c+1]*scale);
+      p.closePath();
+    }
+    ctx.lineWidth=1;
+    for(let q=0;q<NB;q++){
+      const p=paths[q];
+      if(!p)continue;
+      const lum=(q+0.5)/NB;
+      ctx.fillStyle=ctx.strokeStyle=`rgb(${(r0*lum)|0},${(g0*lum)|0},${(b0*lum)|0})`;
+      ctx.fill(p); ctx.stroke(p);
+    }
+  }
+  return {R};
+}
+/* воксельное облако демо-маски */
+const VOX=[];
+for(let k=0;k<N;k++)for(let j=0;j<N;j++)for(let i=0;i<N;i++)
+  if(M[i+N*(j+N*k)]) VOX.push([i-N/2,j-N/2,k-N/2]);
+function drawVoxels(ctx,opt){
+  const ox=opt.cx,oy=opt.cy,scale=opt.scale,yaw=opt.yaw,pitch=opt.pitch;
+  const alphaMul=opt.alpha===undefined?1:opt.alpha;
+  const fadeZ=opt.fadeZ;
+  const cY=Math.cos(yaw),sY=Math.sin(yaw),cP=Math.cos(pitch),sP=Math.sin(pitch);
+  function rot(x,y,z){
+    const x1=x*cY+z*sY, z1=-x*sY+z*cY;
+    return [x1, y*cP-z1*sP, y*sP+z1*cP];
+  }
+  const NRM=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+  const rN=NRM.map(n=>rot(n[0],n[1],n[2]));
+  const faceOrder=[0,1,2,3,4,5].sort((a,b)=>rN[a][2]-rN[b][2]);
+  // цвет грани постоянен по нормали — считаем один раз
+  const faceColor=NRM.map(n=>{
+    let lum=0.30+0.6*Math.abs(n[0]*L1[0]+n[1]*L1[1]+n[2]*L1[2]);
+    if(lum>1)lum=1;
+    const col=[150,168,152];
+    return `rgb(${(col[0]*lum)|0},${(col[1]*lum)|0},${(col[2]*lum)|0})`;
+  });
+  const zarr=new Float32Array(VOX.length);
+  for(let i=0;i<VOX.length;i++)
+    zarr[i]=rot(VOX[i][0],VOX[i][1],VOX[i][2])[2];
+  const order=Array.from({length:VOX.length},(_,i)=>i).sort((a,b)=>zarr[a]-zarr[b]);
+  ctx.globalAlpha=alphaMul;
+  const CH=320;
+  for(let start=0;start<order.length;start+=CH){
+    const end=Math.min(order.length,start+CH);
+    const paths=new Array(6).fill(null);
+    for(let ci=start;ci<end;ci++){
+      const [vx,vy,vz]=VOX[order[ci]];
+      if(fadeZ!==undefined&&vz>fadeZ) continue;
+      for(const fi of faceOrder){
+        const n=rN[fi]; if(n[2]<=0.02)continue;
+        let pts;
+        if(NRM[fi][0]!==0){ const X=vx+(NRM[fi][0]>0?0.5:-0.5);
+          pts=[[X,vy-0.5,vz-0.5],[X,vy+0.5,vz-0.5],[X,vy+0.5,vz+0.5],[X,vy-0.5,vz+0.5]];
+        }else if(NRM[fi][1]!==0){ const Y=vy+(NRM[fi][1]>0?0.5:-0.5);
+          pts=[[vx-0.5,Y,vz-0.5],[vx+0.5,Y,vz-0.5],[vx+0.5,Y,vz+0.5],[vx-0.5,Y,vz+0.5]];
+        }else{ const Z=vz+(NRM[fi][2]>0?0.5:-0.5);
+          pts=[[vx-0.5,vy-0.5,Z],[vx+0.5,vy-0.5,Z],[vx+0.5,vy+0.5,Z],[vx-0.5,vy+0.5,Z]];
+        }
+        let p=paths[fi];
+        if(!p){p=new Path2D();paths[fi]=p;}
+        for(let q=0;q<4;q++){
+          const rr=rot(pts[q][0],pts[q][1],pts[q][2]);
+          const sx=ox+rr[0]*scale, sy=oy-rr[1]*scale;
+          if(q===0)p.moveTo(sx,sy);else p.lineTo(sx,sy);
+        }
+        p.closePath();
+      }
+    }
+    for(let fi=0;fi<6;fi++){
+      if(paths[fi]){ctx.fillStyle=faceColor[fi];ctx.fill(paths[fi]);}
+    }
+  }
+  ctx.globalAlpha=1;
+}
+function drawSweepPlane(ctx,opt){
+  const ox=opt.cx,oy=opt.cy,scale=opt.scale,yaw=opt.yaw,pitch=opt.pitch,z=opt.z;
+  const cY=Math.cos(yaw),sY=Math.sin(yaw),cP=Math.cos(pitch),sP=Math.sin(pitch);
+  function rot(x,y,z2){
+    const x1=x*cY+z2*sY, z1=-x*sY+z2*cY;
+    return [x1, y*cP-z1*sP, y*sP+z1*cP];
+  }
+  const ext=N/2+1.6;
+  const pts=[[-ext,-ext,z],[ext,-ext,z],[ext,ext,z],[-ext,ext,z]].map(p=>rot(p[0],p[1],p[2]));
+  ctx.beginPath();
+  pts.forEach((p,i)=>{const sx=ox+p[0]*scale, sy=oy-p[1]*scale; i?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy);});
+  ctx.closePath();
+  ctx.fillStyle="rgba(76,194,255,0.10)";cx.fill();
+  ctx.strokeStyle="rgba(76,194,255,0.55)";cx.lineWidth=1.2;cx.stroke();
+}
+
+/* ---------------- синтетические «срезы» (2D-часть) ---------------- */
+const SL=192;
+function makeSlice(zoff){
+  const gray=new Uint8ClampedArray(SL*SL), bin=new Uint8Array(SL*SL);
+  for(let y=0;y<SL;y++)for(let x=0;x<SL;x++){
+    const f=fbm(x*0.052,y*0.052,zoff);
+    const wall=Math.abs(f-0.5)<0.052;
+    const n=fbm(x*0.31+40,y*0.31+9,zoff*2);
+    let v;
+    if(wall) v=150+55*n+18*Math.sin(x*0.07)*Math.cos(y*0.06);
+    else{
+      const f2=fbm(x*0.052,y*0.052,zoff+0.35);
+      v=26+20*n+10*(f2-0.5);
+    }
+    gray[y*SL+x]=v;
+    bin[y*SL+x]=v>99?1:0;
+  }
+  return {gray,bin};
+}
+function sliceCanvas(zoff){
+  const s=makeSlice(zoff);
+  const c=document.createElement("canvas");c.width=SL;c.height=SL;
+  const g=c.getContext("2d");
+  const im=g.createImageData(SL,SL);
+  for(let i=0;i<SL*SL;i++){
+    const v=s.gray[i];
+    im.data[4*i]=v; im.data[4*i+1]=v; im.data[4*i+2]=Math.min(255,v+6); im.data[4*i+3]=255;
+  }
+  g.putImageData(im,0,0);
+  return c;
+}
+const sliceImgs=[]; for(let i=0;i<6;i++) sliceImgs.push(sliceCanvas(0.35+i*0.42));
+const baseSlice=sliceImgs[2];
+const S0=makeSlice(0.35+2*0.42);
+function binCanvas(bin){
+  const c=document.createElement("canvas");c.width=SL;c.height=SL;
+  const g=c.getContext("2d");const im=g.createImageData(SL,SL);
+  for(let i=0;i<SL*SL;i++){
+    if(bin[i]){ im.data[4*i]=228;im.data[4*i+1]=234;im.data[4*i+2]=228; }
+    else{ im.data[4*i]=10;im.data[4*i+1]=13;im.data[4*i+2]=18; }
+    im.data[4*i+3]=255;
+  }
+  g.putImageData(im,0,0);return c;
+}
+const binC=binCanvas(S0.bin);
+function closing2d(bin){
+  const dil=new Uint8Array(SL*SL);
+  for(let y=0;y<SL;y++)for(let x=0;x<SL;x++){
+    let o=0;
+    for(let dy=-1;dy<=1&&!o;dy++)for(let dx=-1;dx<=1;dx++){
+      const xx=Math.min(SL-1,Math.max(0,x+dx)),yy=Math.min(SL-1,Math.max(0,y+dy));
+      if(bin[yy*SL+xx]){o=1;break;}
+    }
+    dil[y*SL+x]=o;
+  }
+  const ero=new Uint8Array(SL*SL);
+  for(let y=0;y<SL;y++)for(let x=0;x<SL;x++){
+    let o=1;
+    for(let dy=-1;dy<=1&&o;dy++)for(let dx=-1;dx<=1;dx++){
+      const xx=Math.min(SL-1,Math.max(0,x+dx)),yy=Math.min(SL-1,Math.max(0,y+dy));
+      if(!dil[yy*SL+xx]){o=0;break;}
+    }
+    ero[y*SL+x]=o;
+  }
+  return ero;
+}
+const closedBin=closing2d(S0.bin);
+const diffC=(()=>{
+  const c=document.createElement("canvas");c.width=SL;c.height=SL;
+  const g=c.getContext("2d");const im=g.createImageData(SL,SL);
+  for(let i=0;i<SL*SL;i++){
+    if(closedBin[i]&&!S0.bin[i]){ im.data[4*i]=255;im.data[4*i+1]=140;im.data[4*i+2]=60;im.data[4*i+3]=255; }
+    else im.data[4*i+3]=0;
+  }
+  g.putImageData(im,0,0);return c;
+})();
+const HIST=new Float32Array(128);
+for(let i=0;i<SL*SL;i++) HIST[S0.gray[i]>>1]++;
+
+/* ---------------- вспомогательная графика ---------------- */
+function bg(){
+  cx.fillStyle="#0e141d"; cx.fillRect(0,0,W,H);
+  const g=cx.createRadialGradient(W/2,H/2,120,W/2,H/2,640);
+  g.addColorStop(0,"rgba(76,194,255,0.045)");g.addColorStop(1,"rgba(0,0,0,0)");
+  cx.fillStyle=g;cx.fillRect(0,0,W,H);
+}
+function roundRect(x,y,w,h,r){
+  cx.beginPath();
+  cx.moveTo(x+r,y);cx.arcTo(x+w,y,x+w,y+h,r);cx.arcTo(x+w,y+h,x,y+h,r);
+  cx.arcTo(x,y+h,x,y,r);cx.arcTo(x,y,x+w,y,r);cx.closePath();
+}
+function tag(txt,x,y,color){
+  cx.font="12px 'Segoe UI',Arial";cx.textAlign="left";cx.textBaseline="middle";
+  const w=cx.measureText(txt).width+18;
+  roundRect(x,y-12,w,24,12);
+  cx.fillStyle="rgba(22,32,46,0.92)";cx.fill();
+  cx.strokeStyle="rgba(30,42,58,1)";cx.lineWidth=1;cx.stroke();
+  cx.fillStyle=color||"#4cc2ff";cx.fillText(txt,x+9,y+1);
+  return w;
+}
+function stepBadge(n,name){
+  cx.font="600 15px 'Segoe UI',Arial";cx.textAlign="left";cx.textBaseline="alphabetic";
+  cx.fillStyle="rgba(217,227,238,0.85)";
+  const s=`ШАГ ${n} · ${name}`;
+  cx.fillText(s,26,34);
+  cx.strokeStyle="rgba(76,194,255,0.35)";cx.lineWidth=1;
+  cx.beginPath();cx.moveTo(26,42);cx.lineTo(26+cx.measureText(s).width,42);cx.stroke();
+}
+function footTags(list){ // [[txt,color],...]
+  let x=26;
+  for(const [t,c] of list) x+=tag(t,x,600,c)+10;
+}
+
+/* ---------------- сцены ---------------- */
+let clock=0;
+
+function sceneIntro(t){
+  const names=["JP2-срезы","Куб 512³","Гаусс σ=0.8","Порог Отсу","Закрытие 3³","Marching cubes","Taubin","STL"];
+  const bw=200,bh=54,gx=(W-4*bw)/5,gy1=210,gy2=340;
+  const hi=Math.min(7,Math.floor(t*8.5));
+  cx.fillStyle="#8fa1b5";cx.font="15px 'Segoe UI',Arial";cx.textAlign="center";cx.textBaseline="alphabetic";
+  cx.fillText("Восемь шагов от синхротронных срезов до расчётной геометрии",W/2,130);
+  cx.fillStyle="#5f7186";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("каждый шаг — скрипт, параметр и контроль качества",W/2,154);
+  for(let i=0;i<8;i++){
+    const row=i<4?0:1, colI=i<4?i:i-4;
+    const x=gx+colI*(bw+gx), y=row?gy2:gy1;
+    const active=i<=hi;
+    roundRect(x,y,bw,bh,10);
+    cx.fillStyle=active?"#16293c":"#121a26";cx.fill();
+    cx.strokeStyle=active?"#4cc2ff":"#1e2a3a";cx.lineWidth=active?1.6:1;cx.stroke();
+    cx.fillStyle=active?"#e8f2fb":"#7d90a5";
+    cx.font="600 14px 'Segoe UI',Arial";cx.textAlign="center";cx.textBaseline="middle";
+    cx.fillText(names[i],x+bw/2,y+bh/2+1);
+    if(i<7){
+      let x2,y2,x3,y3;
+      if(i<3){x2=x+bw;y2=gy1+bh/2;x3=x+bw+gx;y3=y2;}
+      else if(i===3){x2=x+bw/2;y2=gy1+bh;x3=x2;y3=gy2;}
+      else{x2=x+bw;y2=gy2+bh/2;x3=x+bw+gx;y3=y2;}
+      cx.strokeStyle=i<hi?"#4cc2ff":"#2a3a50";cx.lineWidth=1.6;
+      cx.beginPath();cx.moveTo(x2,y2);cx.lineTo(x3,y3);cx.stroke();
+      const ang=Math.atan2(y3-y2,x3-x2);
+      cx.fillStyle=i<hi?"#4cc2ff":"#2a3a50";
+      cx.beginPath();
+      cx.moveTo(x3,y3);
+      cx.lineTo(x3-8*Math.cos(ang-0.4),y3-8*Math.sin(ang-0.4));
+      cx.lineTo(x3-8*Math.cos(ang+0.4),y3-8*Math.sin(ang+0.4));
+      cx.closePath();cx.fill();
+    }
+  }
+  cx.textBaseline="alphabetic";
+  footTags([["HiP-CT · ESRF BM05",null],["донор LADAF-2020-27 · левое лёгкое","#ffb454"],["воксель 4.9 мкм",null]]);
+}
+
+function sceneJP2(t,time){
+  stepBadge(1,"СРЕЗЫ JP2");
+  const sw=300, bx=W/2-60, by=130;
+  const baseIdx=Math.floor(time/450)%4;
+  for(let i=2;i>=0;i--){
+    const idx=(baseIdx+i)%6;
+    const x=bx+i*46, y=by+i*30, sc=(0.82+i*0.09);
+    cx.save();
+    cx.translate(x,y);cx.scale(sc,sc);
+    cx.shadowColor="rgba(0,0,0,0.5)";cx.shadowBlur=14;cx.shadowOffsetY=6;
+    cx.drawImage(sliceImgs[idx],0,0,sw,sw);
+    cx.shadowColor="transparent";cx.shadowBlur=0;cx.shadowOffsetY=0;
+    cx.strokeStyle=i===2?"#4cc2ff":"#33445c";cx.lineWidth=i===2?2:1;
+    cx.strokeRect(0,0,sw,sw);
+    cx.restore();
+  }
+  cx.fillStyle="#d9e3ee";cx.font="600 16px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText(`срез Z = ${400+baseIdx} / 999`,bx,by+3*30+320);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("Pillow читает JPEG2000 прямо из zip — без распаковки архива",bx,by+3*30+344);
+  footTags([["ZIP · 725 МБ",null],["999 срезов · 1905×1905","#ffb454"],["uint16 · воксель 4.9 мкм",null]]);
+}
+
+function sceneROI(t){
+  stepBadge(2,"ВЫРЕЗКА КУБА 512³");
+  const sz=420, ox=W/2-sz/2-90, oy=120;
+  cx.drawImage(baseSlice,ox,oy,sz,sz);
+  const rx=ox+295/1905*sz, ry=oy+1044/1905*sz, rw=(807-295)/1905*sz, rh=(1556-1044)/1905*sz;
+  cx.fillStyle="rgba(5,8,12,0.62)";
+  cx.fillRect(ox,oy,sz,Math.max(0,ry-oy));
+  cx.fillRect(ox,ry+rh,sz,Math.max(0,oy+sz-(ry+rh)));
+  cx.fillRect(ox,ry,Math.max(0,rx-ox),rh);
+  cx.fillRect(rx+rw,ry,Math.max(0,ox+sz-(rx+rw)),rh);
+  cx.save();cx.beginPath();cx.rect(rx,ry,rw,rh);cx.clip();
+  cx.drawImage(baseSlice,ox,oy,sz,sz);
+  cx.restore();
+  cx.strokeStyle="#ff5d5d";cx.lineWidth=2.2;
+  cx.setLineDash([7,5]);cx.lineDashOffset=-clock*0.02;
+  cx.strokeRect(rx,ry,rw,rh);
+  cx.setLineDash([]);
+  cx.fillStyle="#ff8a8a";cx.font="600 14px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText("ROI: X 295–807 · Y 1044–1556 · Z 400–911",rx,ry-12);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("чистая паренхима: крупный сосуд и воздуховод обойдены",ox,oy+sz+44);
+  cx.fillText("куб 2.5×2.5×2.5 мм → cube_4.9um_512.npy (memmap, 268 МБ)",ox,oy+sz+64);
+  footTags([["512³ вокселей",null],["ребро 2.5 мм","#ffb454"]]);
+}
+
+function sceneGauss(t){
+  stepBadge(3,"ГАУССОВО СГЛАЖИВАНИЕ");
+  const sz=420, ox=W/2-sz/2, oy=120;
+  const r=t*3.4;
+  cx.save();
+  cx.filter=`blur(${r.toFixed(2)}px)`;
+  cx.drawImage(baseSlice,ox,oy,sz,sz);
+  cx.restore();
+  cx.filter="none";
+  const is=118;
+  cx.drawImage(baseSlice,ox+sz-is-14,oy+sz-is-14,is,is);
+  cx.strokeStyle="#33445c";cx.lineWidth=1;cx.strokeRect(ox+sz-is-14,oy+sz-is-14,is,is);
+  cx.fillStyle="#8fa1b5";cx.font="12px 'Segoe UI',Arial";cx.textAlign="center";
+  cx.fillText("до",ox+sz-is/2-14,oy+sz-2);
+  cx.fillStyle="#d9e3ee";cx.font="600 15px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText(`σ = ${(t*0.8).toFixed(2)} вокселя (цель: 0.8 вокс = 3.9 мкм)`,ox,oy-14);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("шум давим, морфологию не трогаем: σ меньше толщины перегородки (10–30 мкм)",ox,oy+sz+44);
+  footTags([["scipy.ndimage.gaussian_filter",null],["σ = 0.8 вокселя","#ffb454"]]);
+}
+
+function sceneOtsu(t){
+  stepBadge(4,"ПОРОГ ОТСУ");
+  const sz=400, ox=60, oy=130;
+  cx.drawImage(baseSlice,ox,oy,sz,sz);
+  const bA=Math.max(0,Math.min(1,(t-0.55)/0.45));
+  if(bA>0){cx.globalAlpha=bA;cx.drawImage(binC,ox,oy,sz,sz);cx.globalAlpha=1;}
+  const hx=530,hy=150,hw=390,hh=280;
+  cx.fillStyle="#121a26";cx.strokeStyle="#1e2a3a";cx.lineWidth=1;
+  roundRect(hx-16,hy-38,hw+32,hh+82,10);cx.fill();cx.stroke();
+  let hmax=1;for(const v of HIST)if(v>hmax)hmax=v;
+  const bw2=hw/128;
+  for(let i=0;i<128;i++){
+    const h=HIST[i]/hmax*hh;
+    cx.fillStyle=i<50?"#31435c":"#4cc2ff";
+    cx.fillRect(hx+i*bw2,hy+hh-h,bw2-1,h);
+  }
+  const thrP=Math.min(1,Math.max(0,(t-0.12)/0.4));
+  const thrX=hx+(99/128)*hw*thrP;
+  cx.strokeStyle="#ffb454";cx.lineWidth=2;
+  cx.beginPath();cx.moveTo(thrX,hy-12);cx.lineTo(thrX,hy+hh+12);cx.stroke();
+  cx.fillStyle="#ffb454";cx.font="600 13px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText("порог",thrX+7,hy-2);
+  cx.fillStyle="#d9e3ee";cx.font="600 14px 'Segoe UI',Arial";
+  cx.fillText("гистограмма: бимодальна — воздух слева, ткань справа",hx-16,hy-52);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("skimage.filters.threshold_otsu → 25 519 (uint16). Порог — из данных, не вручную.",30,556);
+  cx.fillText("справа на срезе: белое — ткань, чёрное — воздух",30,580);
+  footTags([["порог 25 519",null],["автоматически","#ffb454"]]);
+}
+
+function sceneClosing(t){
+  stepBadge(5,"МОРФОЛОГИЧЕСКОЕ ЗАКРЫТИЕ 3×3×3");
+  const sz=420, ox=W/2-sz/2, oy=110;
+  cx.drawImage(binC,ox,oy,sz,sz);
+  const pulse=0.55+0.45*Math.sin(clock*0.006);
+  cx.globalAlpha=Math.min(1,t*3)*pulse;
+  cx.drawImage(diffC,ox,oy,sz,sz);
+  cx.globalAlpha=1;
+  cx.fillStyle="#ffb454";cx.font="600 14px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText("оранжевое — проколы, заполненные закрытием",ox,oy-14);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("структурный элемент 3 вокселя (15 мкм) меньше толщины стенки —",ox,oy+sz+44);
+  cx.fillText("проколы ≤1 воксель заполняются, соседние альвеолы не склеиваются",ox,oy+sz+64);
+  cx.fillStyle="#d9e3ee";cx.font="600 16px 'Segoe UI',Arial";
+  cx.fillText("доля ткани: 14.9 % → 16.9 %",ox,oy+sz+100);
+  footTags([["scipy.ndimage.binary_closing",null],["маска → mask.npz (5.2 МБ)","#ffb454"]]);
+}
+
+function sceneMarching(t,time){
+  stepBadge(6,"MARCHING CUBES — ИЗОПОВЕРХНОСТЬ");
+  const ox=W/2-90, oy=H/2+10, scale=17;
+  const yaw=clock*0.00045, pitch=0.52;
+  const reveal=t<0.18?0:t<0.8?(t-0.18)/0.62:1;
+  const voxAlpha=t<0.18?1:Math.max(0,1-(t-0.18)/0.5);
+  const fadeZ=mesh.zmax-(mesh.zmax-mesh.zmin)*reveal;
+  if(voxAlpha>0.02) drawVoxels(cx,{cx:ox,cy:oy,scale,yaw,pitch,alpha:voxAlpha,fadeZ});
+  if(reveal>0){
+    drawMesh3D(cx,mesh,{cx:ox,cy:oy,scale,yaw,pitch,reveal});
+    if(reveal<1) drawSweepPlane(cx,{cx:ox,cy:oy,scale,yaw,pitch,z:mesh.zmax-(mesh.zmax-mesh.zmin)*reveal});
+  }
+  const nrev=Math.floor(mesh.nt*Math.min(1,Math.max(0,reveal)));
+  cx.fillStyle="#d9e3ee";cx.font="600 14px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText(`треугольников: ${fmtRu(nrev)} / ${fmtRu(mesh.nt)} (демо-сетка 18³)`,30,600-38);
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("каждые два соседних вокселя воздух/ткань дают треугольники; паддинг воздухом замыкает куб",30,600-14);
+  footTags([["level 0.5 · step 1",null],["spacing 4.9 мкм","#ffb454"],["в RVE 102³ → 252 582 тр.",null]]);
+}
+
+function sceneTaubin(t,time){
+  stepBadge(7,"TAUBIN-СГЛАЖИВАНИЕ (λ|μ)");
+  // сброс к несглаженному при входе
+  if(sceneTaubin.lastEnter!==sceneTaubin.enterId){
+    sceneTaubin.lastEnter=sceneTaubin.enterId;
+    mesh.verts.set(mesh.pristine); mesh.iters=0;
+  }
+  const target=Math.min(25,Math.floor(t*25/Math.max(0.72,1)));
+  while(mesh.iters<Math.min(25,target)){ taubinIter(); }
+  const ox=W/2-90, oy=H/2+10, scale=17;
+  const yaw=clock*0.00045, pitch=0.52;
+  drawMesh3D(cx,mesh,{cx:ox,cy:oy,scale,yaw,pitch,reveal:1});
+  cx.fillStyle="#d9e3ee";cx.font="600 14px 'Segoe UI',Arial";cx.textAlign="left";
+  cx.fillText(`итерация ${mesh.iters} / 25 · λ = 0.5 · ν = −0.53`,30,600-38);
+  cx.fillStyle=mesh.iters>=25?"#3fae72":"#8fa1b5";
+  cx.font="13px 'Segoe UI',Arial";
+  cx.fillText(mesh.iters>=25
+    ?"готово: лестница вокселей ушла, объём сохранён (усадка ≈ 0 %)"
+    :"чередование сглаживающего и обратного прохода = фильтр без усадки",30,600-14);
+  footTags([["trimesh.filter_taubin",null],["λ = 0.5 · ν = 0.53 · 25 итераций","#ffb454"]]);
+}
+
+function sceneSTL(t,time){
+  stepBadge(8,"STL — ГОТОВО");
+  const ox=280, oy=H/2+10, scale=15;
+  const yaw=clock*0.00045, pitch=0.52;
+  drawMesh3D(cx,mesh,{cx:ox,cy:oy,scale,yaw,pitch,reveal:1});
+  // карточки файлов
+  const cxr=560, cw=380;
+  const cards=[
+    ["lung_rve500_tissue.stl","фаза ТКАНИ — альвеолярные стенки",252582,"12.6 МБ","#3fae72"],
+    ["lung_rve500_air.stl","фаза ВОЗДУХА — поры + внешняя полость",345904,"17.3 МБ","#4cc2ff"],
+  ];
+  let y=130;
+  for(const [name,sub,n,size,col] of cards){
+    cx.fillStyle="#121a26";cx.strokeStyle="#1e2a3a";cx.lineWidth=1;
+    roundRect(cxr,y,cw,120,10);cx.fill();cx.stroke();
+    cx.fillStyle="#e8f2fb";cx.font="600 15px 'Consolas,monospace'";cx.textAlign="left";
+    cx.fillText(name,cxr+18,y+30);
+    cx.fillStyle="#8fa1b5";cx.font="12px 'Segoe UI',Arial";
+    cx.fillText(sub,cxr+18,y+52);
+    const shown=Math.floor(n*Math.min(1,t*1.6));
+    cx.fillStyle=col;cx.font="600 22px 'Segoe UI',Arial";
+    cx.fillText(fmtRu(shown)+" тр.",cxr+18,y+92);
+    cx.fillStyle="#5f7186";cx.font="13px 'Segoe UI',Arial";cx.textAlign="right";
+    cx.fillText(size,cxr+cw-18,y+92);
+    cx.textAlign="left";
+    y+=140;
+  }
+  cx.fillStyle="#8fa1b5";cx.font="13px 'Segoe UI',Arial";
+  cx.fillText("обе фазы — из одной воксельной маски; 1 единица STL = 1 мкм",cxr,y+8);
+  cx.fillStyle="#5f7186";
+  cx.fillText("числа — реального RVE 500 мкм; демо-меш слева построен на сетке 18³",cxr,y+30);
+  footTags([["дальше: FEM или продувка воздуха (CFD)","#ffb454"]]);
+}
+
+/* ---------------- описания шагов ---------------- */
+const steps=[
+ {name:"Пайплайн",dur:5000,
+  text:"Восемь шагов от синхротронных срезов до расчётной геометрии. Каждый шаг — скрипт с зафиксированными параметрами и контролем качества.",
+  chips:["HiP-CT · ESRF","LADAF-2020-27","4.9 мкм/воксель"],
+  draw:t=>sceneIntro(t)},
+ {name:"Срезы JP2",dur:5500,
+  text:"Пакет 4.9um_LADAF-2020-27…zip: 999 JPEG2000-срезов 1905×1905 (uint16, воксель 4.9 мкм, 725 МБ). Pillow декодирует их прямо из zip — без распаковки.",
+  chips:["999 срезов","1905×1905","uint16","Pillow + openjpeg"],
+  draw:(t,time)=>sceneJP2(t,time)},
+ {name:"Вырезка куба 512³",dur:5000,
+  text:"Красная рамка — ROI: X 295–807, Y 1044–1556, Z 400–911. Чистая паренхима без крупных сосудов и бронхов. Куб 2.5 мм пишется в .npy через memmap.",
+  chips:["512³","ребро 2.5 мм","memmap 268 МБ"],
+  draw:t=>sceneROI(t)},
+ {name:"Гаусс σ = 0.8",dur:4500,
+  text:"Подавляем фотонный шум до порога. σ меньше толщины перегородки (10–30 мкм): шум уходит, морфология не размывается.",
+  chips:["σ = 0.8 вокс = 3.9 мкм","scipy"],
+  draw:t=>sceneGauss(t)},
+ {name:"Порог Отсу",dur:5500,
+  text:"Гистограмма бимодальна (воздух/ткань) — порог Отсу считается из данных: 25 519 (uint16). Никаких ручных констант.",
+  chips:["порог 25 519","threshold_otsu"],
+  draw:t=>sceneOtsu(t)},
+ {name:"Закрытие 3³",dur:5000,
+  text:"Морфологическое закрытие заполняет проколы ≤1 воксель, не склеивая альвеолы. Доля ткани: 14.9 % → 16.9 %. Маска архивируется в npz — «истина в вокселях».",
+  chips:["binary_closing 3×3×3","14.9 % → 16.9 %","mask.npz 5.2 МБ"],
+  draw:t=>sceneClosing(t)},
+ {name:"Marching cubes",dur:9000,
+  text:"По бинарной маске строится изоповерхность (level 0.5, шаг 1 воксель): каждая граница воздух/ткань даёт треугольники, паддинг замыкает куб. Здесь демо-сетка 18³ — в реальном RVE 102³.",
+  chips:["level 0.5 · step 1","spacing 4.9 мкм","skimage"],
+  draw:(t,time)=>sceneMarching(t,time)},
+ {name:"Taubin",dur:6000,
+  text:"Taubin-сглаживание: λ = 0.5, ν = 0.53, 25 итераций. В отличие от лапласова, не сжимает объём — критично при стенках в 1–3 вокселя.",
+  chips:["λ = 0.5 · ν = 0.53","25 итераций","усадка ≈ 0"],
+  draw:(t,time)=>sceneTaubin(t,time)},
+ {name:"STL готов",dur:7000,
+  text:"Обе фазы из одной маски: ткань и воздух. 1 единица STL = 1 мкм. Числа на карточках — реального RVE 500 мкм; слева — демо-меш 18³, собранный этим же алгоритмом в браузере.",
+  chips:["ткань: 252 582 тр.","воздух: 345 904 тр.","1 ед. = 1 мкм"],
+  draw:(t,time)=>sceneSTL(t,time)},
+];
+const totalDur=steps.reduce((s,st)=>s+st.dur,0);
+
+/* ---------------- движок ---------------- */
+const stepsEl=document.getElementById("steps");
+steps.forEach((s,i)=>{
+  const li=document.createElement("li");
+  li.innerHTML=`<span class="n">${String(i).padStart(2,"0")}</span><span>${s.name}</span>`;
+  li.addEventListener("click",()=>{cur=i;ts=0;playing=true;sceneTaubin.enterId++;syncDesc();replayEl.style.display="none";bPlay.textContent="⏸";});
+  stepsEl.appendChild(li);
+});
+const lis=[...stepsEl.children];
+const stTitle=document.getElementById("stTitle"),stText=document.getElementById("stText"),
+      chipsEl=document.getElementById("chips"),pfill=document.getElementById("pfill"),
+      ptime=document.getElementById("ptime"),bPlay=document.getElementById("bPlay"),
+      replayEl=document.getElementById("replay");
+let cur=0, ts=0, playing=true;
+sceneTaubin.enterId=1; sceneTaubin.lastEnter=0;
+
+function syncDesc(){
+  const s=steps[cur];
+  stTitle.textContent=`${cur}. ${s.name}`;
+  stText.textContent=s.text;
+  chipsEl.innerHTML=s.chips.map(c=>`<span class="chip">${c}</span>`).join("");
+  lis.forEach((li,i)=>{
+    li.classList.toggle("on",i===cur);
+    li.classList.toggle("done",i<cur);
+  });
+}
+syncDesc();
+
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(60,now-last); last=now;
+  clock+=dt;
+  if(playing){
+    ts+=dt;
+    if(ts>=steps[cur].dur){
+      ts=0;
+      if(cur<steps.length-1){ cur++; sceneTaubin.enterId++; syncDesc(); }
+      else{ playing=false; bPlay.textContent="▶"; replayEl.style.display="flex"; }
+    }
+  }
+  bg();
+  const t01=Math.min(1,ts/steps[cur].dur);
+  steps[cur].draw(t01,clock);
+  // прогресс
+  let acc=0; for(let i=0;i<cur;i++)acc+=steps[i].dur;
+  pfill.style.width=(100*(acc+ts)/totalDur).toFixed(2)+"%";
+  ptime.textContent=((acc+ts)/1000).toFixed(1)+" / "+(totalDur/1000).toFixed(0)+" c";
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+document.getElementById("bPrev").addEventListener("click",()=>{
+  cur=Math.max(0,cur-1);ts=0;sceneTaubin.enterId++;syncDesc();replayEl.style.display="none";
+  if(!playing){playing=true;bPlay.textContent="⏸";}
+});
+document.getElementById("bNext").addEventListener("click",()=>{
+  if(cur<steps.length-1){cur++;ts=0;sceneTaubin.enterId++;syncDesc();}
+  replayEl.style.display="none";
+});
+bPlay.addEventListener("click",()=>{
+  if(!playing&&cur===steps.length-1&&ts===0){cur=0;}
+  playing=!playing; bPlay.textContent=playing?"⏸":"▶";
+  if(playing)replayEl.style.display="none";
+});
+document.getElementById("replayBtn").addEventListener("click",()=>{
+  cur=0;ts=0;sceneTaubin.enterId++;syncDesc();playing=true;bPlay.textContent="⏸";
+  replayEl.style.display="none";
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="ArrowLeft")document.getElementById("bPrev").click();
+  if(e.key==="ArrowRight")document.getElementById("bNext").click();
+  if(e.key===" ")bPlay.click();
+});
+</script>
+</body>
+</html>

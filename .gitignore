@@ -1,0 +1,27 @@
+# --- environment ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- raw source data (725 MB, re-downloadable from Human Organ Atlas) ---
+4.9um_*.zip
+_hoa_metadata.json
+
+# --- heavy derived data (regenerable by scripts, see README) ---
+# full 512^3 cube + mask
+data/cube_4.9um_512.npy
+data/cube_4.9um_512_mask.npz
+
+# meshes (STL) - all regenerable from masks
+data/preview/*.stl
+data/rve500/*.stl
+data/tiles/*.stl
+
+# rve500 compact sources
+data/rve500/cube_gray.npy
+# (tile masks *_mask.npz — в репо: они крошечные и хранят офсеты для склейки)
+
+# --- OS / editor ---
+Thumbs.db
+.DS_Store
