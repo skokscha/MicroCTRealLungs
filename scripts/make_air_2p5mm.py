@@ -26,7 +26,10 @@ def main() -> None:
     v_true = air.sum() * VOXEL_UM**3 / 1e9
     print(f"air: {air.mean():.3f} fraction, {v_true:.3f} mm3 (voxel truth)", flush=True)
 
-    padded = np.pad(air, 1, constant_values=False)
+    # pad 2 layers: step_size=2 samples every 2nd voxel ([::2]), so a 1-layer
+    # pad lands on an odd index at the max sides and gets dropped -> 3 missing
+    # box faces (user caught this by overlaying tissue vs air in Blender)
+    padded = np.pad(air, 2, constant_values=False)
     verts, faces, _, _ = marching_cubes(
         padded.astype(np.float32), level=0.5, spacing=(VOXEL_UM,) * 3, step_size=2
     )

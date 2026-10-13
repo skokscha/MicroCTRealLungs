@@ -25,7 +25,8 @@ def main() -> None:
     air = ~mask
     air[256:, :, :] = False  # upper half -> solid: cut plane at z = 1.25 mm
 
-    padded = np.pad(air, 1, constant_values=False)
+    # pad 2 layers: with step_size=2 a 1-layer pad is dropped at the max sides
+    padded = np.pad(air, 2, constant_values=False)
     verts, faces, _, _ = marching_cubes(
         padded.astype(np.float32), level=0.5, spacing=(VOXEL_UM,) * 3, step_size=2
     )
