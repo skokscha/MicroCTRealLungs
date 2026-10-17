@@ -1,12 +1,16 @@
-"""Air-phase surface mesh of the full 2.5 mm cube (512^3) - CORRECT recipe.
+"""Tissue + air surface meshes of the 2.5 mm cube for OpenFOAM.
 
-The air mask is the exact voxel complement of the tissue mask (voxel not in
-tissue -> air), so interface triangles mirror the tissue surface 1:1.
-Marching cubes at step_size=2 (same sampling as the tissue preview mesh),
-NO cluster decimation (that is what wrecked the first attempt), normals fixed
-outward and validated against the voxel-counted air volume (13.12 mm3).
+Both phases are built by the SAME function from the SAME cropped voxel grid, so
+  - they share one marching-cubes sampling grid -> interface triangles mirror 1:1
+  - both are closed with flat caps on all 6 cube faces (watertight)
+  - there is no artificial 1-voxel air frame: the zeroed outer layer of the
+    512^3 mask (index 0 and 511) is cropped away first.
 
-Output: data/preview/lung_air_2p5um_mc2.stl  (~8M faces, ~400 MB)
+Output (data/preview/):
+  lung_cube_tissue_2p5mm.stl   - tissue solid (cavities are voids)
+  lung_cube_air_2p5mm.stl      - air solid (tissue is void)
+Coordinates are in micrometres, origin at the cube corner.
+For OpenFOAM scale to metres: surfaceTransformPoints -scale '(1e-6 1e-6 1e-6)' in.stl out.stl
 """
 from pathlib import Path
 
@@ -18,40 +22,52 @@ from trimesh.exchange.export import export_mesh
 PROJECT = Path(__file__).resolve().parent.parent
 OUT = PROJECT / "data" / "preview"
 VOXEL_UM = 4.9
+STEP = 2  # 1 = full resolution (huge), 2 = ~8M faces for air
+
+
+def phase_mesh(phase: np.ndarray, step: int) -> Trimesh:
+    """Closed, capped surface of a boolean phase on a cubic grid."""
+    n = phase.shape[0]
+    # padded size must be 1 + step*k, otherwise the last (high-side) pad layer
+    # is never sampled and the +x/+y/+z faces stay open
+    pad_hi = (-n) % step or step
+    padded = np.pad(phase, ((1, pad_hi),) * 3, constant_values=False)
+    verts, faces, _, _ = marching_cubes(
+        padded.astype(np.float32),
+        level=0.5,
+        spacing=(VOXEL_UM,) * 3,
+        step_size=step,
+    )
+    verts -= VOXEL_UM  # low cap sits at padded index 1 -> move cube corner to 0
+    m = Trimesh(vertices=verts, faces=faces)
+    m.fix_normals()
+    if m.volume < 0:
+        m.invert()
+    return m
+
+
+def report(name: str, m: Trimesh, v_true_mm3: float) -> None:
+    print(
+        f"{name}: {len(m.faces):,} faces, watertight={m.is_watertight}, "
+        f"volume {m.volume / 1e9:.3f} mm3 vs voxel truth {v_true_mm3:.3f} "
+        f"({100 * m.volume / 1e9 / v_true_mm3:.1f}%), "
+        f"bounds {m.bounds.min(0).round(1)} .. {m.bounds.max(0).round(1)}",
+        flush=True,
+    )
 
 
 def main() -> None:
     mask = np.load(PROJECT / "data" / "cube_4.9um_512_mask.npz")["mask"]
-    air = ~mask  # exact complement: not-tissue -> air
-    v_true = air.sum() * VOXEL_UM**3 / 1e9
-    print(f"air: {air.mean():.3f} fraction, {v_true:.3f} mm3 (voxel truth)", flush=True)
+    tissue = mask[1:-1, 1:-1, 1:-1]  # drop zeroed boundary layers -> 510^3
+    air = ~tissue                    # exact voxel complement
+    print(f"cube {tissue.shape}, tissue fraction {tissue.mean():.3f}", flush=True)
 
-    # pad 2 layers: step_size=2 samples every 2nd voxel ([::2]), so a 1-layer
-    # pad lands on an odd index at the max sides and gets dropped -> 3 missing
-    # box faces (user caught this by overlaying tissue vs air in Blender)
-    padded = np.pad(air, 2, constant_values=False)
-    verts, faces, _, _ = marching_cubes(
-        padded.astype(np.float32), level=0.5, spacing=(VOXEL_UM,) * 3, step_size=2
-    )
-    del padded
-    print(f"marching cubes step2: {len(faces):,} faces", flush=True)
-
-    m = Trimesh(vertices=verts, faces=faces)
-    m.fix_normals()
-    if m.volume < 0:  # normals ended up pointing into the air solid -> flip
-        m.invert()
-    print(
-        f"mesh volume {m.volume / 1e9:.3f} mm3 vs truth {v_true:.3f} "
-        f"({100 * m.volume / 1e9 / v_true:.1f}%)",
-        flush=True,
-    )
-
-    path = OUT / "lung_air_2p5um_mc2.stl"
-    export_mesh(m, str(path))
-    print(
-        f"saved {path.name}: {len(m.faces):,} faces, {path.stat().st_size / 1e6:.0f} MB",
-        flush=True,
-    )
+    for name, phase in [("tissue", tissue), ("air", air)]:
+        m = phase_mesh(phase, STEP)
+        report(name, m, phase.sum() * VOXEL_UM**3 / 1e9)
+        path = OUT / f"lung_cube_{name}_2p5mm.stl"
+        export_mesh(m, str(path))
+        print(f"saved {path.name}, {path.stat().st_size / 1e6:.0f} MB", flush=True)
 
 
 if __name__ == "__main__":
