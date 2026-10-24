@@ -25,6 +25,9 @@ data/preview/*.bin
 data/preview/air_phase_voxels_510.npz
 data/preview/*_voxel_coordinates_510.*
 
+# FE meshes (regenerable from mask)
+*.inp
+
 # rve500 compact sources
 data/rve500/cube_gray.npy
 # (tile masks *_mask.npz — в репо: они крошечные и хранят офсеты для склейки)
